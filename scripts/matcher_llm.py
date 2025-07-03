@@ -12,7 +12,6 @@ Key optimizations include:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures as cf
 import json
 import re
 import textwrap
@@ -102,6 +101,61 @@ def _yes_no(
     llm_cache[cache_key] = result
     return result
 
+
+def _choose_best(
+    snippet: str,
+    sf: str,
+    candidates: List[Tuple[str, str, str]],  # (uri, label, comment)
+    *,
+    chat_ep: str,
+    chat_model: str,
+    llm_cache: Dict,
+) -> str | None:
+    """Ask the LLM to pick the single best candidate URI."""
+    key = (snippet, tuple(c[0] for c in candidates))
+    if key in llm_cache:
+        return llm_cache[key]
+
+    c_txt = "\n".join(
+        f"- {uri} : {lbl} ({comm})" if comm else f"- {uri} : {lbl}"
+        for uri, lbl, comm in candidates
+    )
+    prompt = textwrap.dedent(f"""
+        Choose the single best ontology concept for the term "{sf}".
+        Text snippet: "{snippet}"
+        Candidates:
+        {c_txt}
+        Answer only with the URI of the best candidate or "None".
+    """).strip()
+
+    payload = {
+        "model": chat_model,
+        "temperature": 0.0,
+        "max_tokens": 16,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": "You are a precise ontology expert."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    try:
+        r = requests.post(chat_ep, json=payload, timeout=30)
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"].strip()
+    except (requests.RequestException, KeyError, IndexError):
+        content = "None"
+
+    chosen = None
+    if content.lower() != "none":
+        for uri, _, _ in candidates:
+            if uri in content:
+                chosen = uri
+                break
+
+    llm_cache[key] = chosen
+    return chosen
+
 # ────────────────── Main Annotation Logic ──────────────────
 
 def annotate_document(
@@ -157,29 +211,43 @@ def annotate_document(
             continue
 
         def _mk(idx):
-            return (sf, uris[idx], labels[idx],
-                    get_comment(ontology_path, uris[idx]) or "")
-
-        cand_idx = [v[0] for v in best.values()]
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            # (OPTIMIZATION) Pass the cache to each worker thread.
-            ok_map = ex.map(
-                lambda p: _yes_no(snippet, p, chat_ep=chat_endpoint, chat_model=chat_model, llm_cache=llm_cache),
-                [_mk(i) for i in cand_idx]
+            return (
+                uris[idx],
+                labels[idx],
+                get_comment(ontology_path, uris[idx]) or "",
             )
 
-        for (uri, (idx, sc)), ok in zip(best.items(), ok_map):
-            if not ok:
-                continue
-            
-            key = (sf.lower(), s, e, _canon(uri))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({
-                "surface_form": sf, "start": s, "end": e,
-                "uri": uri, "label": labels[idx], "score": float(sc), "doc": Path(txt_path).name,
-            })
+        cand_idx = [v[0] for v in best.values()]
+        candidates = [_mk(i) for i in cand_idx]
+
+        chosen = _choose_best(
+            snippet,
+            sf,
+            candidates,
+            chat_ep=chat_endpoint,
+            chat_model=chat_model,
+            llm_cache=llm_cache,
+        )
+
+        if not chosen:
+            continue
+
+        idx, sc = best[chosen]
+        key = (sf.lower(), s, e, _canon(chosen))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "surface_form": sf,
+                "start": s,
+                "end": e,
+                "uri": chosen,
+                "label": labels[idx],
+                "score": float(sc),
+                "doc": Path(txt_path).name,
+            }
+        )
             
     return sorted(out, key=lambda x: x['start'])
 
