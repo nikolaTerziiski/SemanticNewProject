@@ -1,134 +1,88 @@
 #!/usr/bin/env python3
-"""
-Извлича surface-форми от RDF/OWL онтология → CSV: form,uri
 
-Включва разширено генериране на форми:
-- Различни регистри (lowercase, Titlecase)
-- Разцепване на camelCase и snake_case
-- Форми за множествено число
-- Лематизация (основна форма на думата)
-"""
 from __future__ import annotations
 
-import argparse
 import csv
 import re
+import sys
 from pathlib import Path
+from typing import Iterable
 
-import inflect
 import rdflib
-import spacy
-from rdflib.namespace import RDFS, SKOS
+from rdflib.namespace import RDFS, SKOS, OWL         
+from rdflib import RDF                            
 
-# --- Инициализация на необходимите библиотеки ---
-p = inflect.engine()
-try:
-    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-except OSError:
-    print("Изтегляне на spaCy модела 'en_core_web_sm'...")
-    from spacy.cli import download
-    download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-
-# --- Регулярни изрази за нормализация и филтриране ---
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
-_SNAKE_RE = re.compile(r"[_-]+")
+_SPLITTER_RE = re.compile(r"[_\-]+")
+
 _BAD_RE = re.compile(
     r"""
-    ^n?[a-f0-9]{8,}$      |  # hex / uuid
-    ^[a-z0-9]{10,}s?$     |  # hex + 's'
-    ^[a-z]+[0-9]{4,}$     |  # дума + много цифри
-    ^[bcdfghjklmnpqrstvwxz]{5,}$  # без гласни
+    ^n?[a-f0-9]{8,}$    
+    |^https?://
     """,
-    re.I | re.X,
+    re.X | re.I,
 )
 
-def _keep(form: str) -> bool:
-    """Филтрира „боклучави“ или неинформативни форми."""
-    return not _BAD_RE.match(form) and len(form) >= 3
+
+def _yield_forms(label: str) -> Iterable[str]:
+    txt = label.strip()
+    if _BAD_RE.match(txt):
+        return
+    yield txt
+    yield _CAMEL_RE.sub(" ", txt)
+    yield _SPLITTER_RE.sub(" ", txt)
 
 
-def _yield_forms(label: str) -> set[str]:
-    """
-    Генерира множество от потенциални повърхностни форми от един етикет.
-    """
-    forms: set[str] = set()
-    base = label.strip()
-    if not base:
-        return forms
-
-    # 1. Основни вариации на регистъра
-    forms.update({base, base.lower(), base.title()})
-
-    # 2. Разцепване на camelCase и snake_case
-    camel = _CAMEL_RE.sub(" ", base).strip()
-    snake = _SNAKE_RE.sub(" ", base).strip()
-    forms.update({camel, camel.lower(), snake, snake.lower()})
-
-    # 3. Добавяне на форми за множествено число
-    plural = p.plural(base)
-    if plural and plural != base:
-        forms.update({plural, plural.lower()})
-        
-    # 4. (НОВО) Добавяне на лема (основна форма на думата)
-    # Помага за съвпадение на "wines" в текста с концепт "wine".
-    doc = nlp(base)
-    lemma = " ".join([token.lemma_ for token in doc])
-    if lemma and lemma != base.lower():
-        forms.add(lemma)
-
-    return {f for f in forms if len(f) > 1}
-
-
-def extract(graph_path: Path):
-    """Генерира всички потенциални двойки (форма, URI) от онтологията."""
+# ──────────────────────────────────────────────────────────────────────────
+def extract(graph_path: Path) -> Iterable[tuple[str, str]]:
     g = rdflib.Graph()
     g.parse(graph_path)
 
-    # (НОВО) Включваме skos:prefLabel, rdfs:label и skos:altLabel
-    properties_to_check = [RDFS.label, SKOS.altLabel, SKOS.prefLabel]
+    allowed_subjects: set[rdflib.term.Node] = set(g.subjects(RDF.type, OWL.Class))
+
+    properties_to_check = (RDFS.label, SKOS.prefLabel, SKOS.altLabel)
 
     for prop in properties_to_check:
         for s, _, l_obj in g.triples((None, prop, None)):
+            if s not in allowed_subjects:                 
+                continue
             for f in _yield_forms(str(l_obj)):
                 yield f, str(s)
-            
-    # Извличане на форми от самия URI
+
     for s in g.subjects():
-        if isinstance(s, rdflib.URIRef):
-            local_name = s.split("#")[-1].split("/")[-1]
-            for f in _yield_forms(local_name):
-                yield f, str(s)
+        if s not in allowed_subjects:                    
+            continue
+        local = str(s).split("#")[-1].split("/")[-1]
+        for f in _yield_forms(local):
+            yield f, str(s)
 
 
-def run(ontology: str | Path, outfile: str | Path) -> Path:
-    """Основна функция за извличане на форми и запис в CSV файл."""
-    ontology = Path(ontology)
-    outfile = Path(outfile)
-    outfile.parent.mkdir(parents=True, exist_ok=True)
+def run(rdf_path: str | Path, out_csv: str | Path | None = None) -> Path:
+    rdf_path = Path(rdf_path)
+    if out_csv is None:
+        out_csv = rdf_path.with_suffix(".surface_forms.csv")
+    out_csv = Path(out_csv)
 
-    dedup = {}
-    for form, uri in extract(ontology):
-        key = form.lower()
-        # Запазваме първия срещнат регистър за дадена форма
-        if key not in dedup and _keep(form):
-            dedup[key] = (form, uri)
+    with out_csv.open("w", newline="", encoding="utf8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["form", "uri"])
+        for sf, uri in sorted(extract(rdf_path)):
+            w.writerow([sf, uri])
 
-    with outfile.open("w", newline="", encoding="utf-8") as fh:
-        wr = csv.writer(fh)
-        wr.writerow(["form", "uri"])
-        # Записваме сортирани за консистентност
-        wr.writerows(sorted(list(dedup.values())))
+    return out_csv
 
-    return outfile
-
-
-# ――――― CLI Interface ―――――
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Извлича повърхностни форми от онтология.")
-    ap.add_argument("ontology", type=Path, help="Път до онтологичния файл (RDF/OWL/TTL).")
-    ap.add_argument("outfile", type=Path, help="Път до изходния CSV файл.")
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("rdf", type=Path, help="Път до онтологичния файл (RDF/OWL/TTL).")
+    ap.add_argument("out_csv", type=Path, help="Къде да се запише surface_forms.csv")
     args = ap.parse_args()
-    
-    run(args.ontology, args.outfile)
-    print(f"[✔] Повърхностните форми са извлечени в → {args.outfile}")
+
+    with args.out_csv.open("w", newline="", encoding="utf8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["form", "uri"])
+        for sf, uri in sorted(extract(args.rdf)):
+            w.writerow([sf, uri])
+
+    print(f"Surface-forms записани в {args.out_csv}")

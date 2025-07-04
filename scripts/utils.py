@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Помощни онтологични функции – кеширани с lru_cache."""
 from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path

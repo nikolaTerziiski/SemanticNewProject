@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Строи FAISS индекс + labels.json от surface_forms.csv
-
-Бързо embed-ване:
-• реже „боклуци“ (същия регекс)
-• праща чанкове по 256 низа
-• 4 паралелни HTTP заявки към LM Studio
-
-CLI пример:
-    python scripts/build_index.py surface_forms.csv \
-        --endpoint http://localhost:1234/v1/embeddings \
-        --model mistral-embed \
-        -o resources/
-"""
 from __future__ import annotations
 
 import argparse

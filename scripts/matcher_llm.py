@@ -1,162 +1,96 @@
-#!/usr/bin/env python3
-"""
-LLM-based disambiguation matcher with caching to optimize performance.
-
-Key optimizations include:
-1.  **LLM Caching**: Avoids re-asking the LLM the same question.
-2.  **Word Boundary Matching**: Prevents partial word matches.
-3.  **Sentence-Aware Context**: Provides full sentences to the LLM.
-4.  **Dynamic Similarity Threshold**: Uses a stricter cutoff for single-word terms.
-5.  **Conservative "Yes/No" Prompt**: Instructs the LLM to be cautious.
-"""
 from __future__ import annotations
 
-import argparse
+# ── stdlib ────────────────────────────────────────────────────────────────
+import concurrent.futures as cf
 import json
 import re
-import textwrap
 from pathlib import Path
-from typing import Dict, List, Tuple
-from urllib.parse import urlparse, urlunparse
+from typing import List, Tuple
 
-import faiss
+# I *might* need itertools later on; leaving it for future experiments.
+import itertools  # noqa: F401
+
+# ── third‑party deps ──────────────────────────────────────────────────────
+import faiss  # type: ignore
 import numpy as np
 import requests
 import spacy
-from scripts.utils import get_comment
 
-# --- Initialize spaCy for sentence detection ---
+# ── spaCy bootstrap (lazy download on first run) ─────────────────────────
 try:
-    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-    nlp.add_pipe('sentencizer')
-except OSError:
-    print("Downloading spaCy model 'en_core_web_sm'...")
-    from spacy.cli import download
-    download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-    nlp.add_pipe('sentencizer')
-    
+    _nlp = spacy.load("en_core_web_sm", exclude=["ner", "parser", "tagger"])
+except OSError:  # Model not found – grab it the slow way
+    spacy.cli.download("en_core_web_sm")
+    _nlp = spacy.load("en_core_web_sm", exclude=["ner", "parser", "tagger"])
 
-# ────────────────── Helpers & Configuration ──────────────────
-_STOP_RE = re.compile(r"^(full|red|white|light|medium|dry|sweet|bold|rich|acidic)$", re.I)
+# Sentencizer is lightweight and good enough for sentence boundaries
+if "sentencizer" not in _nlp.pipe_names:
+    _nlp.add_pipe("sentencizer")
 
-def _canon(u: str) -> str:
-    p = urlparse(u)
-    return urlunparse((p.scheme.lower(), p.netloc.lower(),
-                       p.path.rstrip("/"), "", "", p.fragment.lower()))
+# ─────────────────────────────────────────────────────────────────────────
 
 
-def _embed(texts: List[str], ep: str, model: str) -> np.ndarray:
-    r = requests.post(ep, json={"input": texts, "model": model}, timeout=60)
-    r.raise_for_status()
-    return np.asarray([d["embedding"] for d in r.json()["data"]],
-                      dtype="float32")
+def _embed(texts: List[str], endpoint: str, model: str) -> np.ndarray:
+    """Hit LM‑Studio’s /embeddings endpoint and return **L2‑normalised** vectors."""
 
+    payload = {"input": texts, "model": model}
+    resp = requests.post(endpoint, json=payload, timeout=60)
+    resp.raise_for_status()
 
-def _informative(sf: str) -> bool:
-    return (" " in sf) or (len(sf) > 4 and not _STOP_RE.match(sf))
+    vecs = np.asarray(resp.json()["data"][0]["embedding"], dtype="float32")
+
+    # Shape protection – always (n_rows, n_dim)
+    if vecs.ndim == 1:
+        vecs = vecs[np.newaxis, :]
+
+    # The FAISS index was trained on unit vectors
+    faiss.normalize_L2(vecs)
+    return vecs
 
 
 def _yes_no(
     snippet: str,
     cand: Tuple[str, str, str, str],
-    *, 
-    chat_ep: str, 
-    chat_model: str,
-    llm_cache: Dict  # (OPTIMIZATION) Pass the cache dictionary
-) -> bool:
-    """
-    Asks the LLM a Yes/No question, using a cache to avoid redundant calls.
-    """
-    # (OPTIMIZATION) Use the snippet and candidate URI as a unique key.
-    cache_key = (snippet, cand[1]) 
-    if cache_key in llm_cache:
-        return llm_cache[cache_key]
-
-    sf, _, lbl, comm = cand
-    prompt = textwrap.dedent(f"""
-        Answer only with "Yes" or "No".
-        Text snippet: "{snippet}"
-        Does the term "{sf}" in this context refer to the concept: {lbl} ({comm})?
-    """).strip()
-
-    payload = {
-        "model": chat_model, "temperature": 0.0, "max_tokens": 8, "stream": False,
-        "messages": [
-            {"role": "system", "content": "You are a precise ontology expert. If you are unsure, you must answer 'No'."},
-            {"role": "user", "content": prompt},
-        ],
-    }
-    
-    try:
-        r = requests.post(chat_ep, json=payload, timeout=30)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"].strip().lower()
-        result = (content == "yes")
-    except (requests.RequestException, KeyError, IndexError):
-        result = False
-
-    # (OPTIMIZATION) Store the new result in the cache before returning.
-    # The cache is a standard dict, which is thread-safe enough for this use case.
-    llm_cache[cache_key] = result
-    return result
-
-
-def _choose_best(
-    snippet: str,
-    sf: str,
-    candidates: List[Tuple[str, str, str]],  # (uri, label, comment)
     *,
     chat_ep: str,
     chat_model: str,
-    llm_cache: Dict,
-) -> str | None:
-    """Ask the LLM to pick the single best candidate URI."""
-    key = (snippet, tuple(c[0] for c in candidates))
-    if key in llm_cache:
-        return llm_cache[key]
+    llm_cache: dict,
+) -> bool:
+    """Fire a quick *Yes/No* Q to the chat model and return the interpretation.
 
-    c_txt = "\n".join(
-        f"- {uri} : {lbl} ({comm})" if comm else f"- {uri} : {lbl}"
-        for uri, lbl, comm in candidates
+    The LLM sometimes gets cheeky with longer answers, so we only look at the
+    first char and consider any 'y'/'Y' a positive.
+    """
+
+    sf, uri, label, _ = cand
+    cache_key = (snippet, uri)
+
+    # Cheap memoisation – the same (sentence, candidate) combo repeats a lot.
+    if cache_key in llm_cache:
+        return llm_cache[cache_key]
+
+    prompt = (
+        "Answer with 'Yes' or 'No' only.\n\n"
+        f"Does the phrase «{sf}» in the sentence «{snippet}» "
+        f"refer to the ontology concept «{label}»?"
     )
-    prompt = textwrap.dedent(f"""
-        Choose the single best ontology concept for the term "{sf}".
-        Text snippet: "{snippet}"
-        Candidates:
-        {c_txt}
-        Answer only with the URI of the best candidate or "None".
-    """).strip()
 
-    payload = {
-        "model": chat_model,
-        "temperature": 0.0,
-        "max_tokens": 16,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": "You are a precise ontology expert."},
-            {"role": "user", "content": prompt},
-        ],
-    }
+    resp = requests.post(
+        chat_ep,
+        json={
+            "model": chat_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
 
-    try:
-        r = requests.post(chat_ep, json=payload, timeout=30)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"].strip()
-    except (requests.RequestException, KeyError, IndexError):
-        content = "None"
+    ans = resp.json()["choices"][0]["message"]["content"].strip().lower()
+    ok = ans.startswith("y")
+    llm_cache[cache_key] = ok
+    return ok
 
-    chosen = None
-    if content.lower() != "none":
-        for uri, _, _ in candidates:
-            if uri in content:
-                chosen = uri
-                break
-
-    llm_cache[key] = chosen
-    return chosen
-
-# ────────────────── Main Annotation Logic ──────────────────
 
 def annotate_document(
     txt_path: str | Path,
@@ -170,111 +104,126 @@ def annotate_document(
     chat_model: str = "mistral",
     top_k: int = 10,
     threshold: float = 0.55,
-    single_word_threshold: float = 0.75,
+    single_word_threshold: float = 0.85,  # raised from 0.75 during tinkering
     max_workers: int = 8,
 ) -> List[dict]:
-    
-    # (OPTIMIZATION) Initialize the cache for this annotation run.
-    llm_cache = {}
+    """Return a list of ontology annotations for *txt_path*.
 
+    Parameters largely mirror the original script; they’ve been kept to avoid
+    accidental behaviour drift.
+    """  # noqa: D401 – preferable as one-liner for now
+
+    # ---- Load index & label metadata ------------------------------------
     index = faiss.read_index(str(idx_path))
-    with Path(lbl_path).open(encoding="utf-8") as fh:
-        lab = json.load(fh)
-    forms, uris = lab["forms"], lab["uris"]
-    labels = [re.sub(r"[_#]", " ", u.split("#")[-1].split("/")[-1]) or u for u in uris]
 
-    text = Path(txt_path).read_text(encoding="utf-8")
-    mentions = _find_mentions(text, forms)
-    text_doc = nlp(text)
+    with open(lbl_path, encoding="utf8") as fh:
+        meta = json.load(fh)
 
-    out, seen = [], set()
-    for sf, s, e in mentions:
-        if not _informative(sf):
-            continue
-            
-        snippet = _snippet(text_doc, s, e)
-        q = _embed([snippet], embed_endpoint, embed_model)
-        faiss.normalize_L2(q)
-        D, I = index.search(q, top_k)
+    labels: List[str] = [
+        re.sub(r"[_#]", " ", uri.split("#")[-1].split("/")[-1])
+        for uri in meta["uris"]
+    ]
 
-        is_single_word = " " not in sf
-        current_threshold = single_word_threshold if is_single_word else threshold
-        
-        smap = {i: float(sc) for i, sc in zip(I[0], D[0]) if sc >= current_threshold}
+    # TODO: use *ontology_path* to pull in alt labels & definitions.
+    _onto_path = Path(ontology_path)  # kept for future enrichment – unused for now
 
-        best = {}
-        for idx, sc in smap.items():
-            uri = uris[idx]
-            if uri not in best or sc > best[uri][1]:
-                best[uri] = (idx, sc)
-        if not best:
-            continue
+    # ---- Read document ---------------------------------------------------
+    doc_text = Path(txt_path).read_text(encoding="utf8")
+    doc = _nlp(doc_text)
 
-        def _mk(idx):
-            return (
-                uris[idx],
-                labels[idx],
-                get_comment(ontology_path, uris[idx]) or "",
-            )
+    annotations: List[dict] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    llm_cache: dict = {}
 
-        cand_idx = [v[0] for v in best.values()]
-        candidates = [_mk(i) for i in cand_idx]
+    # ---- Loop over sentences --------------------------------------------
+    for sent in doc.sents:
+        snippet = sent.text
 
-        chosen = _choose_best(
-            snippet,
-            sf,
-            candidates,
-            chat_ep=chat_endpoint,
-            chat_model=chat_model,
-            llm_cache=llm_cache,
-        )
+        # Greedy surface‑form regex (copied from the OG script)
+        for match in re.finditer(r"\b\w(?:[\w\- ]*\w)?\b", snippet):
+            sf = match.group(0)
+            start = sent.start_char + match.start()
+            end = sent.start_char + match.end()
 
-        if not chosen:
-            continue
+            vec = _embed([sf], embed_endpoint, embed_model)
+            distances, indices = index.search(vec, top_k)
 
-        idx, sc = best[chosen]
-        key = (sf.lower(), s, e, _canon(chosen))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(
-            {
-                "surface_form": sf,
-                "start": s,
-                "end": e,
-                "uri": chosen,
-                "label": labels[idx],
-                "score": float(sc),
-                "doc": Path(txt_path).name,
+            # Index returns 2‑D arrays; we only have a single query row
+            candidates = {
+                meta["uris"][idx]: (idx, dist)
+                for idx, dist in zip(indices[0], distances[0])
+                if dist >= (
+                    single_word_threshold if " " not in sf else threshold
+                )
             }
-        )
-            
-    return sorted(out, key=lambda x: x['start'])
+            if not candidates:
+                continue 
 
-# ───────── Updated Utils: Mentions / Snippets ─────────
-def _find_mentions(txt: str, forms: List[str]) -> list[tuple[str, int, int]]:
-    mentions = []
-    unique_lower_forms = set(f.lower() for f in forms if f)
+            # Ask the LLM to disambiguate the *snippet* vs each candidate
+            with cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                ok_map = pool.map(
+                    lambda p: _yes_no(
+                        snippet,
+                        p,
+                        chat_ep=chat_endpoint,
+                        chat_model=chat_model,
+                        llm_cache=llm_cache,
+                    ),
+                    [
+                        (sf, uri, labels[idx], snippet)
+                        for uri, (idx, _) in candidates.items()
+                    ],
+                )
 
-    for form in unique_lower_forms:
-        try:
-            for match in re.finditer(rf"\b{re.escape(form)}\b", txt, re.IGNORECASE):
-                mentions.append((match.group(0), match.start(), match.end()))
-        except re.error:
-            continue
-    return sorted(list(set(mentions)), key=lambda x: x[1])
+            # Събираме тези, които са окей
+            for (uri, (idx, score)), ok in zip(candidates.items(), ok_map):
+                if not ok:
+                    continue
 
-def _snippet(doc: spacy.tokens.Doc, s: int, e: int) -> str:
-    span = doc.char_span(s, e, alignment_mode="expand")
-    if span and span.sent:
-        return span.sent.text.replace("\n", " ").strip()
-    return doc.text[max(0, s - 70):min(len(doc.text), e + 70)].replace("\n", " ")
+                dup_key = (sf.lower(), start, end, labels[idx].lower())
+                if dup_key in seen:
+                    continue  # Тоест, ако имаме вече по-добър, просто скипваме
 
-# ───────── CLI Quick Test ─────────
+                seen.add(dup_key)
+
+                annotations.append(
+                    {
+                        "surface_form": sf,
+                        "start": start,
+                        "end": end,
+                        "uri": uri,
+                        "label": labels[idx],
+                        "score": float(score),
+                        "doc": Path(txt_path).name,
+                    }
+                )
+
+    # Най-добрия annotation
+    span_best: dict[tuple[str, int, int], dict] = {}
+    for ann in annotations:
+        k = (ann["doc"], ann["start"], ann["end"])
+        if k not in span_best or ann["score"] > span_best[k]["score"]:
+            span_best[k] = ann
+
+    # Final sort: left‑to‑right, break ties by descending score
+    return sorted(span_best.values(), key=lambda x: (x["start"], -x["score"]))
+
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) != 5:
-        sys.exit("Usage: python scripts/matcher_llm.py <doc.txt> <index.faiss> <labels.json> <ontology.ttl>")
-    doc, idx, lbl, onto = map(Path, sys.argv[1:5])
-    res = annotate_document(doc, idx, lbl, ontology_path=onto)
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(
+            "Usage: python matcher_llm.py <doc.txt> <index.faiss> <labels.json> <ontology.rdf>"
+        )
+
+    doc_path, idx_path, lbl_path, onto_path = map(Path, sys.argv[1:5])
+
+    result = annotate_document(
+        doc_path,
+        idx_path,
+        lbl_path,
+        ontology_path=onto_path,
+    )
+
+    # Print with Unicode intact – much nicer on a Bulgarian terminal :)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
